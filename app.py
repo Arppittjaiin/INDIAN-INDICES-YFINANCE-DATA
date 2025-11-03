@@ -1,226 +1,342 @@
-#!/usr/bin/env python3
-"""
-Incremental Yahoo index downloader — Optimized
------------------------------------------------
-✓ Thread-safe, resumable CSV storage
-✓ Works with pandas <2.2 (no ISO8601 dependency)
-✓ Parallel downloads with per-symbol throttling
-✓ Robust timezone & date parsing
-✓ Automatic recovery from corrupted CSVs
-✓ Reduced I/O and smarter backstep logic
-"""
-
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Dict, Optional, Tuple
-import warnings
-
+from datetime import timedelta
+from zipfile import ZipFile
 import pandas as pd
+import streamlit as st
 import yfinance as yf
-from tqdm import tqdm
 
-# Suppress known yfinance warnings
-warnings.simplefilter("ignore", FutureWarning)
+# ============================================================
+# 🧼 Clean startup: remove invalid or 1970 timestamp files
+# ============================================================
+def purge_invalid_csvs(data_dir="data"):
+    if not os.path.exists(data_dir):
+        return
+    for root, _, files in os.walk(data_dir):
+        for file in files:
+            if file.endswith(".csv"):
+                path = os.path.join(root, file)
+                try:
+                    df = pd.read_csv(path, nrows=5)
+                    if "datetime" in df.columns:
+                        years = pd.to_datetime(df["datetime"], errors="coerce").dt.year
+                        if years.lt(1980).any():
+                            os.remove(path)
+                            print(f"🧹 Deleted invalid file: {path}")
+                except Exception:
+                    os.remove(path)
+                    print(f"🧹 Deleted corrupted file: {path}")
 
-# ────────────────────────────── User settings ────────────────────────────── #
+purge_invalid_csvs()
 
-INDICES: Dict[str, str] = {
-    "NIFTY50": "^NSEI",
-    "BANKNIFTY": "^NSEBANK",
-    "NIFTYIT": "^CNXIT",
-    "NIFTYFMCG": "^CNXFMCG",
-    "NIFTYPHARMA": "^CNXPHARMA",
-    "NIFTYMETAL": "^CNXMETAL",
-    "NIFTYAUTO": "^CNXAUTO",
-    "SENSEX": "^BSESN",
+# ============================================================
+# 📊 Index tickers with fallbacks
+# ============================================================
+INDICES = {
+    "Nifty 50": ["^NSEI", "NIFTYBEES.NS"],
+    "Sensex": ["^BSESN", "SENSEX.BO"],
+    "BankNifty": ["^NSEBANK", "BANKBEES.NS"],
 }
 
-TIMEFRAMES = ["1m", "5m", "15m", "1h", "1d", "1wk", "1mo"]
-
-FRESH_LIMITS = {
-    "1m":  {"period": "7d"},
-    "5m":  {"period": "60d"},
-    "15m": {"period": "60d"},
-    "1h":  {"period": "2y"},
-    "1d":  {"start": "2000-01-01"},
-    "1wk": {"start": "2000-01-01"},
-    "1mo": {"start": "2000-01-01"},
+# Supported timeframes
+VALID_TIMEFRAMES = {
+    "1m": "1m",
+    "2m": "2m",
+    "5m": "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "1h": "60m",
+    "1d": "1d",
+    "1wk": "1wk",
+    "1mo": "1mo",
 }
 
-# Backstep for overlap (to catch splits/dividends)
-BACKSTEP_DAYS = {
-    "1h": 1,
-    "1d": 1,
-    "1wk": 7,
-    "1mo": 35,  # >31 to ensure full month overlap
-}
-
-OUT_DIR = Path("index_data")
-OUT_DIR.mkdir(exist_ok=True)
-
-MAX_WORKERS = min(16, (os.cpu_count() or 4) + 4)  # Reduce to avoid Yahoo rate limits
-
-# Per-symbol download cooldown (seconds)
-SYMBOL_COOLDOWN: Dict[str, float] = {}
-
-# ────────────────────────────── Helpers ────────────────────────────── #
-
-def csv_path(index_name: str, tf: str) -> Path:
-    return OUT_DIR / f"{index_name}_{tf}.csv"
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+MAX_RETRIES = 3
+RETRY_DELAY = 5
 
 
-def load_existing(path: Path) -> Tuple[pd.DataFrame, Optional[pd.Timestamp]]:
-    """Returns (df, last_timestamp) — avoids repeated index[-1] calls."""
-    if not path.exists():
-        return pd.DataFrame(), None
-
-    try:
-        # Use infer_datetime_format for pandas <2.2 compatibility
-        df = pd.read_csv(path, index_col=0, parse_dates=True, infer_datetime_format=True)
-    except (pd.errors.EmptyDataError, pd.errors.ParserError, ValueError) as e:
-        print(f"⚠️ Corrupted CSV {path.name}: {e}. Backing up and resetting.")
-        backup = path.with_suffix('.csv.corrupted')
-        path.rename(backup)
-        return pd.DataFrame(), None
-    except Exception as e:
-        print(f"⚠️ Unexpected error reading {path.name}: {e}")
-        return pd.DataFrame(), None
-
+# ============================================================
+# 🧹 Cleaning helper - FIXED VERSION
+# ============================================================
+def clean_ohlc_data(df: pd.DataFrame):
+    """Clean OHLC data with better error handling"""
     if df.empty:
-        return df, None
-
-    # Normalize timezone to UTC
+        return pd.DataFrame(), {"rows": 0, "error": "Empty input dataframe"}
+    
+    df = df.copy()
+    
+    # First, handle the index if it contains datetime
+    if isinstance(df.index, pd.DatetimeIndex):
+        df = df.reset_index()
+    
+    # Remove duplicate columns
+    df = df.loc[:, ~df.columns.duplicated()]
+    df.columns = [str(c).lower().strip() for c in df.columns]
+    
+    # Find datetime column
+    dt_col = next((c for c in df.columns if any(k in c for k in ["datetime", "date", "timestamp"])), None)
+    if not dt_col:
+        return pd.DataFrame(), {"rows": 0, "error": "No datetime column found"}
+    
+    # Rename to standardize
+    if dt_col != "datetime":
+        df.rename(columns={dt_col: "datetime"}, inplace=True)
+    
+    # Convert to datetime - handle if it's already datetime
+    if not pd.api.types.is_datetime64_any_dtype(df["datetime"]):
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    
+    # Remove NaT values
+    df = df.dropna(subset=["datetime"])
+    
+    if df.empty:
+        return pd.DataFrame(), {"rows": 0, "error": "All datetime values invalid"}
+    
+    # Filter out pre-1980 dates (but don't fail if none exist)
+    initial_rows = len(df)
+    df = df[df["datetime"].dt.year >= 1980]
+    
+    if df.empty:
+        return pd.DataFrame(), {"rows": 0, "error": f"All {initial_rows} rows had dates before 1980"}
+    
+    # Handle timezone - make timezone-naive for IST
     try:
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC")
-        else:
-            df.index = df.index.tz_convert("UTC")
-        df = df.sort_index()
-        last_ts = df.index[-1]
-        return df, last_ts
+        if df["datetime"].dt.tz is not None:
+            # Convert to IST then remove timezone info
+            df["datetime"] = df["datetime"].dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+        # If already naive, assume it's in IST
     except Exception as e:
-        print(f"⚠️ Timezone error in {path.name}: {e}")
-        return pd.DataFrame(), None
-
-
-def build_dl_kwargs(tf: str, last_ts: Optional[pd.Timestamp]) -> dict:
-    kwargs = {"interval": tf, "auto_adjust": False, "progress": False, "timeout": 20}
+        print(f"⚠️ Timezone conversion warning: {e}")
     
-    if last_ts is None:
-        kwargs.update(FRESH_LIMITS[tf])
-    else:
-        if tf in BACKSTEP_DAYS:
-            # Subtract days and convert to naive date string
-            start_dt = (last_ts.tz_localize(None) - pd.Timedelta(days=BACKSTEP_DAYS[tf]))
-            kwargs["start"] = start_dt.strftime("%Y-%m-%d")
-        else:
-            # Intraday: use period (Yahoo doesn't support start/end for <1d reliably)
-            kwargs["period"] = FRESH_LIMITS[tf]["period"]
-    return kwargs
-
-
-def enforce_symbol_cooldown(symbol: str, min_interval: float = 2.0):
-    """Prevent hammering Yahoo with requests for same symbol."""
-    now = time.time()
-    last = SYMBOL_COOLDOWN.get(symbol, 0)
-    if now - last < min_interval:
-        time.sleep(min_interval - (now - last))
-    SYMBOL_COOLDOWN[symbol] = time.time()
-
-
-def download_one(index_name: str, symbol: str, tf: str) -> Tuple[str, str, int, str]:
-    path = csv_path(index_name, tf)
+    # Keep relevant columns
+    keep_cols = ["datetime"] + [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+    df = df[keep_cols].drop_duplicates(subset=["datetime"]).sort_values("datetime")
     
-    # Load only to get last timestamp (minimize I/O)
-    _, last_ts = load_existing(path)
+    info = {
+        "rows": len(df),
+        "first_dt": df["datetime"].min(),
+        "last_dt": df["datetime"].max(),
+    }
     
-    # Enforce cooldown per symbol to avoid rate limits
-    enforce_symbol_cooldown(symbol)
+    return df, info
 
-    kwargs = build_dl_kwargs(tf, last_ts)
 
-    # Attempt download with retry
-    new_df = pd.DataFrame()
-    for attempt in range(3):
+# ============================================================
+# 📥 Download functions - IMPROVED
+# ============================================================
+def safe_download(ticker, interval, start=None, period=None):
+    """Download with retry & filtering out empty/1970 data."""
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            new_df = yf.download(symbol, **kwargs)
-            if not new_df.empty:
-                break
-        except Exception as exc:
-            err_str = str(exc)
-            if "Invalid input - start date cannot be after end date" in err_str:
-                return index_name, tf, 0, "up-to-date (date range)"
-            if "possibly delisted" in err_str or "No data found" in err_str:
-                return index_name, tf, 0, "symbol invalid"
-            if attempt < 2:
-                time.sleep(3 * (attempt + 1))
+            df = yf.download(
+                ticker,
+                interval=interval,
+                start=start,
+                period=period,
+                progress=False,
+                auto_adjust=True,
+            )
+            
+            if df.empty:
+                print(f"⚠️ Empty dataframe for {ticker} {interval}")
+                continue
+            
+            # Check if data is valid
+            if hasattr(df.index, 'year') and df.index.min().year > 1980:
+                print(f"✅ Valid data from {ticker}: {len(df)} rows, range {df.index.min()} to {df.index.max()}")
+                return df
             else:
-                return index_name, tf, 0, f"download failed: {type(exc).__name__}"
+                print(f"⚠️ Invalid date range for {ticker}")
+                
+        except Exception as e:
+            print(f"⚠️ Attempt {attempt} failed for {ticker} {interval}: {e}")
+        
+        if attempt < MAX_RETRIES:
+            time.sleep(RETRY_DELAY * attempt)
+    
+    return pd.DataFrame()
 
-    if new_df.empty:
-        return index_name, tf, 0, "up-to-date (empty response)"
 
-    # Normalize new data timezone
-    try:
-        if new_df.index.tz is None:
-            new_df.index = new_df.index.tz_localize("UTC")
+def try_tickers_download(ticker_list, interval, start=None, period=None):
+    """Try primary then fallback tickers."""
+    for tkr in ticker_list:
+        df = safe_download(tkr, interval, start=start, period=period)
+        if not df.empty:
+            print(f"✅ Data fetched from {tkr}")
+            return df
         else:
-            new_df.index = new_df.index.tz_convert("UTC")
-    except Exception as e:
-        return index_name, tf, 0, f"timezone error: {e}"
+            print(f"⚠️ No data for {tkr}, trying fallback...")
+    return pd.DataFrame()
 
-    # Load full existing data only if needed
-    if last_ts is not None and not new_df.empty:
-        old_df, _ = load_existing(path)
-        if not old_df.empty:
-            new_df = new_df[new_df.index > last_ts]
-            if new_df.empty:
-                return index_name, tf, 0, "up-to-date (no new data)"
-            combined = pd.concat([old_df, new_df]).sort_index()
-            combined = combined[~combined.index.duplicated(keep='last')]
-        else:
-            combined = new_df
+
+def download_index_data(index_name, tickers, interval):
+    """Download, clean, and save one timeframe."""
+    index_dir = os.path.join(DATA_DIR, index_name.lower().replace(" ", "_"))
+    os.makedirs(index_dir, exist_ok=True)
+    file_path = os.path.join(index_dir, f"{index_name.lower().replace(' ', '_')}_{interval}.csv")
+    
+    # Load existing data
+    existing = pd.DataFrame()
+    start_date = None
+    if os.path.exists(file_path):
+        try:
+            existing = pd.read_csv(file_path, parse_dates=["datetime"])
+            if not existing.empty:
+                existing, _ = clean_ohlc_data(existing)
+                if not existing.empty:
+                    start_date = (existing["datetime"].max() + timedelta(days=1)).strftime("%Y-%m-%d")
+                    print(f"📂 Existing data found, updating from {start_date}")
+        except Exception as e:
+            print(f"⚠️ Error loading existing file: {e}")
+    
+    # Determine period based on interval
+    if interval == "1m":
+        period = "7d"
+    elif "m" in interval or "h" in interval:
+        period = "60d"
     else:
-        combined = new_df
+        period = "max"
+    
+    # Download new data
+    df = try_tickers_download(tickers, interval, start=start_date, period=None if start_date else period)
+    
+    # Fallback for 1m data
+    if df.empty and interval == "1m":
+        print("⚠️ Retrying 1m with 7d period...")
+        df = try_tickers_download(tickers, interval, period="7d")
+    
+    if df.empty:
+        error_msg = f"No data downloaded for {index_name} {interval}"
+        print(f"❌ {error_msg}")
+        return existing, {"rows": 0, "error": error_msg}
+    
+    # Handle multi-level columns from yfinance (when downloading multiple tickers)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    
+    # Reset index to get datetime as column
+    df = df.reset_index()
+    
+    # Remove duplicate columns AFTER flattening multi-index
+    df = df.loc[:, ~df.columns.duplicated()]
+    
+    # Standardize column names
+    df.columns = [str(c).lower().strip() for c in df.columns]
+    
+    # Ensure datetime column exists with proper naming
+    if "date" in df.columns:
+        df.rename(columns={"date": "datetime"}, inplace=True)
+    elif "datetime" not in df.columns:
+        # If there's still no datetime column, look for variations
+        possible_dt_cols = [c for c in df.columns if isinstance(c, str) and ('date' in c.lower() or c.lower() in ['timestamp', 'time'])]
+        if possible_dt_cols:
+            df.rename(columns={possible_dt_cols[0]: "datetime"}, inplace=True)
+        else:
+            # Last resort: first column is probably datetime
+            df.rename(columns={df.columns[0]: "datetime"}, inplace=True)
+    
+    # Clean the data
+    clean_df, info = clean_ohlc_data(df)
+    
+    if clean_df.empty:
+        error_msg = info.get("error", "Unknown cleaning error")
+        print(f"❌ Cleaning failed: {error_msg}")
+        return existing, {"rows": 0, "error": error_msg}
+    
+    # Merge with existing data
+    if not existing.empty:
+        final_df = pd.concat([existing, clean_df]).drop_duplicates(subset=["datetime"]).sort_values("datetime")
+    else:
+        final_df = clean_df
+    
+    # Save to CSV
+    final_df.to_csv(file_path, index=False)
+    print(f"💾 Saved {len(final_df)} rows to {file_path}")
+    
+    return final_df, info
 
-    # Save safely
-    try:
-        combined.to_csv(path)
-    except Exception as e:
-        return index_name, tf, 0, f"save error: {e}"
 
-    return index_name, tf, len(new_df), "ok"
-
-
-# ────────────────────────────── Main ────────────────────────────── #
-
-def main() -> None:
-    print("📥 Starting incremental index data update …\n")
-    total_jobs = len(INDICES) * len(TIMEFRAMES)
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool, tqdm(total=total_jobs, unit="job") as bar:
-        futures = [
-            pool.submit(download_one, idx_name, sym, tf)
-            for idx_name, sym in INDICES.items()
-            for tf in TIMEFRAMES
-        ]
-
-        for f in as_completed(futures):
-            index_name, tf, rows, status = f.result()
-            icon = "✅" if "up-to-date" in status or status == "ok" else "❌"
-            msg = f"{index_name:<12} {tf:<4} → {icon} "
-            if status == "ok":
-                msg += f"{rows} new rows"
-            else:
-                msg += status
-            tqdm.write(msg)
-            bar.update()
-
-    print("\n✅ All indices updated incrementally.")
+def zip_all_data():
+    """Zip all valid CSVs."""
+    zip_path = os.path.join(DATA_DIR, "indices_data.zip")
+    with ZipFile(zip_path, "w") as zipf:
+        for root, _, files in os.walk(DATA_DIR):
+            for f in files:
+                if f.endswith(".csv"):
+                    full_path = os.path.join(root, f)
+                    arcname = os.path.relpath(full_path, DATA_DIR)
+                    zipf.write(full_path, arcname)
+    return zip_path
 
 
-if __name__ == "__main__":
-    main()
+# ============================================================
+# 🎨 Streamlit UI
+# ============================================================
+st.set_page_config(page_title="Nifty & Sensex — Cleaned OHLC Dashboard", layout="wide")
+st.title("📈 Nifty & Sensex — Cleaned OHLC Dashboard")
+
+col1, col2 = st.columns(2)
+index_choice = col1.selectbox("Select Index", list(INDICES.keys()), index=0)
+tf_choice = col2.selectbox("Select Timeframe", list(VALID_TIMEFRAMES.keys()), index=6)
+
+st.divider()
+
+# --- Single Download ---
+if st.button("📥 Download / Refresh Data"):
+    with st.spinner(f"Fetching {index_choice} ({tf_choice}) data..."):
+        df, info = download_index_data(index_choice, INDICES[index_choice], VALID_TIMEFRAMES[tf_choice])
+    
+    if df.empty or info.get("rows", 0) == 0:
+        error = info.get("error", "Unknown error")
+        st.error(f"⚠️ No valid data for {index_choice} ({tf_choice}) — {error}")
+    else:
+        st.success(f"✅ {index_choice} ({tf_choice}) ready — {info['rows']} rows (from {info['first_dt']} to {info['last_dt']})")
+        st.dataframe(df.tail(20))
+        
+        if "close" in df.columns:
+            st.line_chart(df.set_index("datetime")["close"])
+        
+        zip_path = zip_all_data()
+        with open(zip_path, "rb") as f:
+            st.download_button("⬇️ Download All Data (ZIP)", data=f, file_name="indices_data.zip")
+
+# --- Bulk Download ---
+elif st.button("🌐 Bulk Download / Refresh All Symbols & Timeframes"):
+    progress = st.progress(0)
+    total = len(INDICES) * len(VALID_TIMEFRAMES)
+    count = 0
+    summary = []
+    
+    with st.spinner("Fetching all indices and timeframes..."):
+        for idx_name, tickers in INDICES.items():
+            st.markdown(f"### 🏦 {idx_name}")
+            for tf, tf_code in VALID_TIMEFRAMES.items():
+                count += 1
+                df, info = download_index_data(idx_name, tickers, tf_code)
+                
+                if df.empty or info.get("rows", 0) == 0:
+                    error = info.get("error", "Unavailable")
+                    st.warning(f"⚠️ {tf} — {error}")
+                    summary.append([idx_name, tf, f"⚠️ {error}"])
+                else:
+                    st.success(f"✅ {tf} done — {info['rows']} rows")
+                    summary.append([idx_name, tf, f"✅ {info['rows']} rows"])
+                
+                progress.progress(count / total)
+            st.divider()
+        
+        zip_path = zip_all_data()
+        with open(zip_path, "rb") as f:
+            st.download_button("⬇️ Download All CSVs (ZIP)", data=f, file_name="all_indices_data.zip")
+        
+        # --- Summary Table ---
+        st.subheader("📊 Summary of Downloaded Data")
+        df_summary = pd.DataFrame(summary, columns=["Index", "Timeframe", "Status"])
+        st.dataframe(df_summary)
+    
+    st.success("🌟 Bulk download completed successfully!")
+
+else:
+    st.info("Click **Download / Refresh Data** or **Bulk Download** to start.")
