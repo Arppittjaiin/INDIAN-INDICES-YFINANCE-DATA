@@ -1,0 +1,5 @@
+streamlit>=1.29
+yfinance>=0.2.30
+pandas>=2.0
+numpy
+pyarrow
