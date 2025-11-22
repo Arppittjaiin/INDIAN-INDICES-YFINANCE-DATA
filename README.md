@@ -195,15 +195,3 @@ This project is licensed under the **MIT License**.
 
 ---
 
-# 🌐 Optional Enhancements
-
-* 📷 Add screenshots of UI.
-* 🔗 Publish on Streamlit Cloud.
-* 🧪 Add tests for data cleaning.
-* 📘 Add API documentation.
-
----
-
-If you'd like, I can also generate:
-✅ A polished `requirements.txt`
-✅ A downloadable DOCX/PDF of this README
