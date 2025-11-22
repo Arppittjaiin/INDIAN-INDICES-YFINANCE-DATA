@@ -65,10 +65,10 @@ Source: fileciteturn0file0
 
 ```bash
 # 1. Clone the repository
-https://github.com/<your-user>/<your-repo>.git
-cd <your-repo>
+git clone https://github.com/Arppittjaiin/INDIAN-INDICES-YFINANCE-DATA.git
+cd INDIAN-INDICES-YFINANCE-DATA
 
-# 2. Create virtual environment (recommended)
+# 2. Create a virtual environment (recommended)
 python -m venv venv
 source venv/bin/activate   # macOS / Linux
 venv\Scripts\activate      # Windows
