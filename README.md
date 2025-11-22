@@ -1,86 +1,197 @@
-# Indian Index Data Downloader
+# 📈 Nifty & Sensex — Cleaned OHLC Dashboard
 
-Incremental Yahoo Finance data downloader for Indian stock market indices (NSE & BSE).
+## ✅ What This README Covers
 
-## Features
+* Summarizes the project purpose and structure.
+* Documents features, UI flow, and backend logic.
+* Provides installation, setup, and execution steps.
+* Lists configuration, dependencies, and project architecture.
+* Includes badges and usage examples.
 
-- ✅ **Thread-safe & Resumable**: Safe concurrent downloads with CSV-based storage
-- ✅ **Multiple Timeframes**: 1m, 5m, 15m, 1h, 1d, 1wk, 1mo
-- ✅ **Incremental Updates**: Only downloads new data on subsequent runs
-- ✅ **Robust Error Handling**: Handles corrupted CSVs, API errors, and timezone issues
-- ✅ **Parallel Downloads**: Utilizes multiple threads for faster updates
+---
 
-## Supported Indices
+# 📌 Project Overview
 
-- **NSE**: NIFTY50, BANKNIFTY, NIFTYIT, NIFTYFMCG, NIFTYPHARMA, NIFTYMETAL, NIFTYAUTO
-- **BSE**: SENSEX
+A **Streamlit-based OHLC Dashboard** that downloads, cleans, caches, and visualizes intraday & historical data for major Indian indices — **Nifty 50**, **Sensex**, and **BankNifty**.
 
-## Installation
+This optimized version enhances:
+
+* ⚡ **Performance** (vectorized data ops, caching, threading)
+* 🔁 **Data reliability** (robust cleaning, retry logic, fallback tickers)
+* 🧹 **Automatic corruption handling** (invalid/corrupt CSV cleanup)
+* 📦 **Local storage management** (CSV + Parquet + ZIP archive export)
+
+Source: fileciteturn0file0
+
+---
+
+# 🏷️ Badges
+
+![Python](https://img.shields.io/badge/Python-3.10+-blue)
+![Streamlit](https://img.shields.io/badge/Streamlit-App-red)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow)
+
+---
+
+# ⚙️ Features
+
+* 🧭 **Supports 3 major Indian indices**: Nifty 50, Sensex, BankNifty.
+* ⏱️ **Multiple timeframes**: 1m → 1mo.
+* 🔁 **Fallback tickers** for reliable data retrieval.
+* 📥 **Incremental downloads** (updates only missing data).
+* 🧽 **Corrupt CSV auto-cleaning** on startup.
+* 🧹 **Data cleaning pipeline** ensuring valid datetime & OHLC format.
+* 🗄️ **Local caching** via CSV + Parquet.
+* 📦 **Bulk download** for *all* indices/timeframes.
+* 📊 **Interactive charts & data preview**.
+* 🗂️ **One-click ZIP export** of all CSVs.
+* 🚀 **Threaded bulk fetching** for faster refresh.
+
+---
+
+# 🧠 Tech Stack
+
+* **Python**
+* **Streamlit** (UI)
+* **yfinance** (data ingestion)
+* **Pandas** (data processing)
+* **ThreadPoolExecutor** (parallel tasks)
+* **Parquet** (fast local caching)
+* **ZipFile** (export utility)
+
+---
+
+# 🛠️ Installation & Setup
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/indian-index-downloader.git
-cd indian-index-downloader
+# 1. Clone the repository
+git clone https://github.com/Arppittjaiin/INDIAN-INDICES-YFINANCE-DATA.git
+cd INDIAN-INDICES-YFINANCE-DATA
 
-# Install dependencies
+# 2. Create a virtual environment (recommended)
+python -m venv venv
+source venv/bin/activate   # macOS / Linux
+venv\Scripts\activate      # Windows
+
+# 3. Install dependencies
 pip install -r requirements.txt
 ```
 
-## Usage
+If you do not have a `requirements.txt`, generate one:
 
 ```bash
-python app.py
+pip install streamlit pandas yfinance
+pip freeze > requirements.txt
 ```
 
-The script will:
-1. Create an `index_data/` directory if it doesn't exist
-2. Download historical data for all indices and timeframes
-3. On subsequent runs, only fetch new data since the last update
+---
 
-## Data Output
+# 🚀 Usage
 
-CSV files are saved in `index_data/` with the format: `{INDEX_NAME}_{TIMEFRAME}.csv`
+Run the Streamlit app:
 
-Example: `NIFTY50_1d.csv`, `BANKNIFTY_5m.csv`
+```bash
+streamlit run app.py
+```
 
-Each CSV contains OHLCV data:
-- Open
-- High
-- Low
-- Close
-- Volume
+Inside the UI:
 
-## Configuration
+* Select Index → Select Timeframe
+* Click **“📥 Download / Refresh Data”**
+* Or run **Bulk Download** for all symbols/timeframes.
 
-Edit `app.py` to customize:
+Example output includes:
 
-- **INDICES**: Add or remove indices
-- **TIMEFRAMES**: Modify timeframe list
-- **FRESH_LIMITS**: Adjust historical data limits
-- **MAX_WORKERS**: Control parallel download threads
+* A cleaned OHLC dataframe
+* A closing price chart
+* ZIP download button for all stored CSVs
 
-## Requirements
+---
 
-- Python 3.8+
-- pandas
-- yfinance
-- tqdm
+# 🛠️ How It Works
 
-## Notes
+## 🔎 API & Data Pipeline
 
-- Yahoo Finance has rate limits; the script includes retry logic and backoff
-- Intraday data (1m, 5m, 15m) has limited historical availability
-- Data is stored in the UTC timezone
-- Corrupted CSV files are automatically backed up and recreated
+### 1. **Download Logic**
 
-## License
+* Tries primary ticker → falls back to alternative tickers.
+* Retries on failure with exponential backoff.
+* Auto-adjusted yfinance OHLC data.
 
-MIT License
+### 2. **Data Cleaning**
 
-## Contributing
+Cleans using `clean_ohlc_data()`:
 
-Pull requests are welcome! For major changes, please open an issue first.
+* Validates datetime columns.
+* Converts timezone-aware timestamps to IST.
+* Removes invalid rows (<1980 or NaT).
+* Standardizes OHLC column names.
+* Drops duplicates.
 
-## Disclaimer
+### 3. **Caching**
 
-This tool is for educational and research purposes. Ensure you comply with Yahoo Finance's terms of service.
+* Uses CSV + Parquet.
+* On load, files are validated.
+* Corrupted files are automatically deleted.
+
+### 4. **Bulk Download Mode**
+
+* Parallel execution with up to 8 threads.
+* Dynamic progress updates.
+* Summary table of all index/timeframe results.
+
+---
+
+# 🗂️ Folder Structure
+
+```
+project/
+│
+├── app.py                # Streamlit dashboard
+├── data/                 # Auto-created on first run
+│   ├── nifty_50/         # Cached CSV/Parquet
+│   ├── Sensex/
+│   ├── banknifty/
+│   └── indices_data.zip  # Exported ZIP
+└── requirements.txt
+```
+
+---
+
+# 📊 Configuration
+
+* **DATA_DIR**: directory for cached symbols
+* **MAX_RETRIES**: retry attempts for yfinance
+* **PARQUET_CACHE**: toggle Parquet usage
+* **VALID_TIMEFRAMES**: allowed intraday/daily intervals
+* **INDICES**: primary + fallback tickers
+* **Threading**: controlled via `MAX_THREADS`
+
+---
+
+# 📦 Dependencies
+
+Recommended `requirements.txt`:
+
+```txt
+streamlit>=1.29
+yfinance>=0.2.30
+pandas>=2.0
+numpy
+pyarrow
+```
+
+---
+
+# 👨‍💻 Author
+
+**Author: Arpit Jain (AJ)**
+
+---
+
+# 📄 License
+
+This project is licensed under the **MIT License**.
+
+---
+
