@@ -1,12 +1,12 @@
 # optimized_indices_dashboard.py
 """
-Optimized single-file version of the user's Streamlit + yfinance data pipeline.
+Optimized single-file version of the user's data pipeline (Terminal Version).
 Preserves all original behavior and outputs while improving:
  - performance (vectorized pandas ops, caching),
  - API usage (retries, backoff, batched downloads, reuse),
  - memory usage (parquet cache),
  - structure & maintainability (clear functions, docstrings),
- - UI responsiveness (non-blocking bulk operations via threads).
+ - User experience (clear terminal output).
 """
 
 import os
@@ -21,7 +21,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
-import streamlit as st
 import yfinance as yf
 
 # -------------------------
@@ -174,7 +173,8 @@ def clean_ohlc_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     # Handle timezone-aware datetimes: convert to IST then drop tz information
     # Vectorized tz handling: check dtype once
     try:
-        if pd.api.types.is_datetime64tz_dtype(df["datetime"]):
+        # Check for timezone-aware dtype using proper pandas API to avoid deprecation warning
+        if isinstance(df["datetime"].dtype, pd.DatetimeTZDtype):
             df["datetime"] = df["datetime"].dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
     except Exception as e:
         # Non-fatal; proceed assuming naive timestamps are in IST
@@ -321,8 +321,15 @@ def download_index_data(index_name: str, tickers: List[str], interval: str) -> T
     if not existing.empty:
         # Continue from next day of last datetime (preserves original logic)
         start_dt = existing["datetime"].max()
-        # For intraday intervals, start next minute; for daily+ use next day
-        start_date = (start_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+        # Continue from the last available date to ensure partial days (intraday) are updated
+        # and checking for any corrections in the last daily candle.
+        start_date = start_dt.strftime("%Y-%m-%d")
+
+        # Avoid requesting future data (yfinance errors out)
+        if start_date > datetime.now().strftime("%Y-%m-%d"):
+             logger.info(f"⏭️  Data up to date for {index_name} {interval} (next start {start_date} > today).")
+             return existing, {"rows": 0, "first_dt": existing["datetime"].min(), "last_dt": existing["datetime"].max()}
+
         logger.info(f"📂 Existing data found for {index_name} {interval}, updating from {start_date}")
 
     # Choose period for initial download if no existing data
@@ -375,16 +382,20 @@ def download_index_data(index_name: str, tickers: List[str], interval: str) -> T
         return existing, {"rows": 0, "error": error_msg}
 
     # Merge with existing dataset while keeping original behavior (concatenate, drop duplicate datetimes)
+    added_rows = 0
     if not existing.empty:
         final_df = pd.concat([existing, clean_df], axis=0, ignore_index=True)
         final_df = final_df.drop_duplicates(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
+        added_rows = len(final_df) - len(existing)
     else:
         final_df = clean_df.copy()
+        added_rows = len(final_df)
 
     # Save to CSV and parquet (atomic)
     _save_dataframe(file_path, final_df)
 
-    logger.info(f"💾 Saved {len(final_df)} rows to {file_path}")
+    logger.info(f"💾 Saved {len(final_df)} rows to {file_path} (+{added_rows} new)")
+    info["added_rows"] = added_rows
     return final_df, info
 
 # -------------------------
@@ -400,92 +411,59 @@ def zip_all_data(out_name: str = ZIP_NAME) -> Path:
     return zip_path
 
 # -------------------------
-# Streamlit UI (keeps original flow)
+# Main Execution (Terminal)
 # -------------------------
-st.set_page_config(page_title="Nifty & Sensex — Cleaned OHLC Dashboard", layout="wide")
-st.title("📈 Nifty & Sensex — Cleaned OHLC Dashboard")
-
-col1, col2 = st.columns(2)
-index_choice = col1.selectbox("Select Index", list(INDICES.keys()), index=0)
-tf_choice = col2.selectbox("Select Timeframe", list(VALID_TIMEFRAMES.keys()), index=6)
-
-st.divider()
-
-# Helper to run download in background thread to keep UI responsive for bulk
-def _run_download_and_display(index_name: str, tf_code: str):
-    df, info = download_index_data(index_name, INDICES[index_name], tf_code)
-    return df, info
-
-# Single Download button
-if st.button("📥 Download / Refresh Data"):
-    with st.spinner(f"Fetching {index_choice} ({tf_choice}) data..."):
-        df, info = download_index_data(index_choice, INDICES[index_choice], VALID_TIMEFRAMES[tf_choice])
-
-    if df.empty or info.get("rows", 0) == 0:
-        error = info.get("error", "Unknown error")
-        st.error(f"⚠️ No valid data for {index_choice} ({tf_choice}) — {error}")
-    else:
-        st.success(f"✅ {index_choice} ({tf_choice}) ready — {info['rows']} rows (from {info['first_dt']} to {info['last_dt']})")
-        st.dataframe(df.tail(20))
-
-        if "close" in df.columns:
-            # Streamlit expects index for time series plots
-            st.line_chart(df.set_index("datetime")["close"])
-
-        zip_path = zip_all_data()
-        with open(zip_path, "rb") as f:
-            st.download_button("⬇️ Download All Data (ZIP)", data=f, file_name=zip_path.name)
-
-# Bulk Download button
-elif st.button("🌐 Bulk Download / Refresh All Symbols & Timeframes"):
-    progress = st.progress(0)
+def main():
+    logger.info("Starting bulk download...")
     total = len(INDICES) * len(VALID_TIMEFRAMES)
     count = 0
     summary = []
-
-    # Use a ThreadPoolExecutor to run index/timeframe downloads concurrently but conservatively
-    # This accelerates bulk operations without changing final outputs.
-    tasks = []
-    with st.spinner("Fetching all indices and timeframes..."):
-        with ThreadPoolExecutor(max_workers=min(MAX_THREADS, total)) as executor:
-            future_to_meta = {}
-            for idx_name, tickers in INDICES.items():
-                st.markdown(f"### 🏦 {idx_name}")
-                for tf_display, tf_code in VALID_TIMEFRAMES.items():
-                    # submit task
-                    future = executor.submit(download_index_data, idx_name, tickers, tf_code)
-                    future_to_meta[future] = (idx_name, tf_display)
-            # As futures complete, update UI
-            for fut in as_completed(future_to_meta):
-                idx_name, tf_display = future_to_meta[fut]
-                try:
-                    df, info = fut.result()
-                except Exception as e:
-                    df = pd.DataFrame()
-                    info = {"rows": 0, "error": str(e)}
-                count += 1
-                if df.empty or info.get("rows", 0) == 0:
-                    error = info.get("error", "Unavailable")
-                    st.warning(f"⚠️ {idx_name} {tf_display} — {error}")
-                    summary.append([idx_name, tf_display, f"⚠️ {error}"])
+    
+    with ThreadPoolExecutor(max_workers=min(MAX_THREADS, total)) as executor:
+        future_to_meta = {}
+        for idx_name, tickers in INDICES.items():
+            for tf_display, tf_code in VALID_TIMEFRAMES.items():
+                future = executor.submit(download_index_data, idx_name, tickers, tf_code)
+                future_to_meta[future] = (idx_name, tf_display)
+        
+        for fut in as_completed(future_to_meta):
+            idx_name, tf_display = future_to_meta[fut]
+            try:
+                df, info = fut.result()
+            except Exception as e:
+                df = pd.DataFrame()
+                info = {"rows": 0, "error": str(e)}
+            
+            count += 1
+            if df.empty:
+                error = info.get("error", "Unavailable")
+                logger.warning(f"[{count}/{total}] ⚠️  {idx_name} {tf_display} — {error}")
+                summary.append([idx_name, tf_display, f"⚠️  {error}"])
+            elif info.get("rows", 0) == 0:
+                if info.get("error"):
+                    error = info["error"]
+                    logger.warning(f"[{count}/{total}] ⚠️  {idx_name} {tf_display} — {error}")
+                    summary.append([idx_name, tf_display, f"⚠️  {error}"])
                 else:
-                    st.success(f"✅ {idx_name} {tf_display} done — {info['rows']} rows")
-                    summary.append([idx_name, tf_display, f"✅ {info['rows']} rows"])
-                progress.progress(count / total)
-                # small yield to ensure UI updates
-                time.sleep(0.1)
+                    logger.info(f"[{count}/{total}] ✅ {idx_name} {tf_display} is up to date")
+                    summary.append([idx_name, tf_display, "✅ Up to date"])
+            else:
+                added = info.get("added_rows", 0)
+                if added > 0:
+                    logger.info(f"[{count}/{total}] ✅ {idx_name} {tf_display} updated — {added} new rows added")
+                    summary.append([idx_name, tf_display, f"✅ +{added} rows"])
+                else:
+                    logger.info(f"[{count}/{total}] ✅ {idx_name} {tf_display} refreshed — data verified up to date")
+                    summary.append([idx_name, tf_display, "✅ Verified"])
 
-        # finished all tasks
-        zip_path = zip_all_data()
-        with open(zip_path, "rb") as f:
-            st.download_button("⬇️ Download All CSVs (ZIP)", data=f, file_name=zip_path.name)
+    zip_path = zip_all_data()
+    logger.info(f"💾 All data zipped to: {zip_path}")
 
-        # Summary table
-        st.subheader("📊 Summary of Downloaded Data")
-        df_summary = pd.DataFrame(summary, columns=["Index", "Timeframe", "Status"])
-        st.dataframe(df_summary)
+    # Summary
+    logger.info("\n📊 Summary of Downloaded Data:")
+    for item in summary:
+        logger.info(f"{item[0]} {item[1]}: {item[2]}")
+    logger.info("🌟 Bulk download completed successfully!")
 
-    st.success("🌟 Bulk download completed successfully!")
-
-else:
-    st.info("Click **Download / Refresh Data** or **Bulk Download** to start.")
+if __name__ == "__main__":
+    main()
